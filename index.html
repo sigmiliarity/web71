@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head><script>
+(function() {
+  const CHUNK_SIZE = 26214400; // 25 MB per chunk
+  const TOTAL_CHUNKS = 259;
+  const TOTAL_SIZE = CHUNK_SIZE * TOTAL_CHUNKS;
+
+  // 1. Core chunk stitching function
+  async function fetchVirtualRange(start, end) {
+    const contentLength = (end - start) + 1;
+    const startChunkIdx = Math.floor(start / CHUNK_SIZE);
+    const endChunkIdx = Math.floor(end / CHUNK_SIZE);
+    const slicedBuffer = new Uint8Array(contentLength);
+    let offset = 0;
+
+    for (let i = startChunkIdx; i <= endChunkIdx; i++) {
+      const chunkNumber = i + 1;
+      const chunkUrl = new URL(`./game/${chunkNumber}.data`, window.location.href).href;
+      
+      const chunkGlobalStart = i * CHUNK_SIZE;
+      const localStart = Math.max(0, start - chunkGlobalStart);
+      const localEnd = Math.min(CHUNK_SIZE - 1, end - chunkGlobalStart);
+
+      const res = await window.fetch(chunkUrl, {
+        cache: "no-store",
+        headers: { Range: `bytes=${localStart}-${localEnd}` }
+      });
+
+      if (!res.ok && res.status !== 206) {
+        throw new Error(`Chunk ${chunkNumber} failed with status ${res.status}`);
+      }
+
+      const buf = await res.arrayBuffer();
+      const actualLen = buf.byteLength;
+      let targetBytes;
+
+      if (res.status === 206) {
+        targetBytes = new Uint8Array(buf);
+      } else {
+        const safeStart = Math.min(localStart, actualLen);
+        const safeEnd = Math.min(localEnd, actualLen - 1);
+        const safeLen = Math.max(0, (safeEnd - safeStart) + 1);
+        targetBytes = new Uint8Array(buf, safeStart, safeLen);
+      }
+
+      const writeLen = Math.min(targetBytes.byteLength, contentLength - offset);
+      if (writeLen > 0) {
+        slicedBuffer.set(targetBytes.subarray(0, writeLen), offset);
+        offset += writeLen;
+      }
+    }
+    return slicedBuffer;
+  }
+
+  // 2. Intercept global fetch() to virtualize game.data requests
+  const originalFetch = window.fetch;
+  window.fetch = async function(resource, init) {
+    let url = typeof resource === 'string' ? resource : resource?.url;
+    if (url && (url.endsWith('/game.data') || url === 'game.data' || url.includes('game.data'))) {
+      const rangeHeader = init?.headers?.Range || init?.headers?.get?.('Range');
+      if (rangeHeader) {
+        const match = rangeHeader.match(/bytes=(\d+)-(\d+)/);
+        if (match) {
+          const start = parseInt(match[1], 10);
+          const end = parseInt(match[2], 10);
+          try {
+            const bytes = await fetchVirtualRange(start, end);
+            return new Response(bytes, {
+              status: 206,
+              headers: {
+                'Content-Type': 'application/octet-stream',
+                'Content-Range': `bytes ${start}-${end}/${TOTAL_SIZE}`,
+                'Content-Length': bytes.length.toString(),
+                'Accept-Ranges': 'bytes'
+              }
+            });
+          } catch (err) {
+            return new Response("game.data read failed", { status: 500 });
+          }
+        }
+      }
+    }
+    return originalFetch.apply(this, arguments);
+  };
+
+  // 3. Intercept global XMLHttpRequest (used by readSync)
+  const originalXhrOpen = XMLHttpRequest.prototype.open;
+  const originalXhrSend = XMLHttpRequest.prototype.send;
+  const originalXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+  XMLHttpRequest.prototype.open = function(method, url, async, user, password) {
+    this._isGameData = url && (url.endsWith('/game.data') || url === 'game.data' || url.includes('game.data'));
+    this._rangeHeader = null;
+    return originalXhrOpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+    if (this._isGameData && header.toLowerCase() === 'range') {
+      this._rangeHeader = value;
+    }
+    return originalXhrSetHeader.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function(body) {
+    if (this._isGameData && this._rangeHeader) {
+      const xhr = this;
+      const match = this._rangeHeader.match(/bytes=(\d+)-(\d+)/);
+      if (match) {
+        const start = parseInt(match[1], 10);
+        const end = parseInt(match[2], 10);
+
+        fetchVirtualRange(start, end).then(bytes => {
+          Object.defineProperties(xhr, {
+            status: { value: 206, writable: true },
+            statusText: { value: "Partial Content", writable: true },
+            responseText: { value: String.fromCharCode.apply(null, bytes), writable: true },
+            response: { value: bytes.buffer, writable: true },
+            readyState: { value: 4, writable: true }
+          });
+          if (typeof xhr.onload === 'function') xhr.onload();
+          if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange();
+        }).catch(() => {
+          Object.defineProperties(xhr, {
+            status: { value: 500, writable: true },
+            readyState: { value: 4, writable: true }
+          });
+          if (typeof xhr.onerror === 'function') xhr.onerror();
+        });
+        return;
+      }
+    }
+    return originalXhrSend.apply(this, arguments);
+  };
+
+  // 4. Trap MCSMFiles definition and disable its isolated worker thread
+  let _mcsmRef = null;
+  Object.defineProperty(window, 'MCSMFiles', {
+    configurable: true,
+    enumerable: true,
+    get() { return _mcsmRef; },
+    set(v) {
+      _mcsmRef = v;
+      if (v) {
+        // Forces fallback to main-thread drain() where our fetch interceptor works
+        v.helper = function() { return null; };
+      }
+    }
+  });
+})();
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Minecraft: Story Mode</title>
+<link rel="icon" href="data:,">
+<style>
+@font-face{font-family:Rubik;src:url(rubik.woff2) format("woff2");font-weight:300 900;font-display:block}
+html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000}
+#canvas{--aspect:1.7777778;position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(100vw,calc(100vh*var(--aspect)));height:min(100vh,calc(100vw/var(--aspect)));background:#000;display:block;outline:none;cursor:none}
+#start{--w:min(100vw,177.7778vh);--h:calc(var(--w)*.5625);position:absolute;inset:0;width:100%;height:100%;margin:0;padding:0;border:0;background:#6c8fdb url(backdrop.jpg) center/cover no-repeat;color:#fff;font:500 18px Rubik,system-ui,sans-serif;cursor:pointer}
+#start:disabled{cursor:progress}
+#start.hidden{display:none}
+#logo{position:absolute;left:50%;top:calc(50% - var(--h)*.061);width:calc(var(--w)*.718);transform:translate(-50%,-50%);user-select:none;pointer-events:none}
+#status{position:absolute;left:0;right:0;top:calc(50% + var(--h)*.218 - .6em);margin:0 auto;width:max-content;max-width:92vw;font-size:max(15px,calc(var(--h)*.032));line-height:1.2;letter-spacing:.02em;text-align:center;text-shadow:0 2px 6px rgba(10,20,50,.75),0 0 2px rgba(10,20,50,.9)}
+#options{position:absolute;left:50%;bottom:5vh;transform:translateX(-50%);width:max-content;max-width:92vw;box-sizing:border-box;display:flex;flex-wrap:wrap;justify-content:center;gap:10px 18px;padding:12px 18px;border-radius:10px;background:rgba(10,14,24,.66);color:#c9d2e6;font:13px Rubik,system-ui,sans-serif;font-size:clamp(13px,1.6vh,20px)}
+#options.hidden{display:none}
+#options label{display:flex;flex-direction:column;gap:4px}
+#options select{background:#111;color:#ddd;border:1px solid #333;border-radius:4px;padding:5px 8px;font:inherit;cursor:pointer}
+#options select:disabled{color:#666;cursor:default}
+</style>
+</head>
+<body>
+<canvas id="canvas" width="1920" height="1080" tabindex="0"></canvas>
+<button id="start" disabled><img id="logo" src="logo.png" alt="Minecraft: Story Mode WASM Edition" draggable="false"><span id="status">Loading…</span></button>
+<div id="options">
+<label>Quality<select id="option-quality"></select></label>
+<label>Frame rate<select id="option-fps"><option value="60">60 fps</option><option value="uncapped">Unlimited</option></select></label>
+<label>Anti-aliasing<select id="option-aa"><option value="smooth">Smooth</option><option value="sharp">Sharp</option></select></label>
+<label>Shadows<select id="option-shadows"><option value="auto">Auto</option><option value="on">On</option><option value="off">Off</option></select></label>
+<label>Multithreading<select id="option-threads"><option value="on">On</option><option value="off">Off</option></select></label>
+</div>
+<script src="sw2.js"></script>
+<script src="quality.js"></script>
+<script src="filesystem.js"></script>
+<script src="audio.js"></script>
+<script src="loader.js"></script>
+</body>
+</html>
